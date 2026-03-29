@@ -1,0 +1,7 @@
+.env
+config/*.txt
+data/processed.json
+tmp/
+__pycache__/
+*.pyc
+.DS_Store
