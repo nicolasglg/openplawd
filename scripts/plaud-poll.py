@@ -1,46 +1,45 @@
 #!/usr/bin/env python3
 """
-OpenPlawd — Plaud polling + transcription for OpenClaw.
+OpenPlawd — Plaud polling + transcription Groq Whisper.
 
-- < 90 min  → Groq Whisper (free tier)
-- >= 90 min → OpenAI Whisper (paid, no hourly quota)
-- Chunk-based transcription with resume on interruption
-- Structured JSON output for OpenClaw agent processing
+- Transcription : Groq Whisper API (large-v3, gratuit)
+- Chunking automatique pour fichiers > 24 MB
+- Resumable : chunks sauvegardes individuellement, reprise au prochain run
+- Un seul recording par run (evite surcharge contexte agent)
+- Pause entre chunks pour eviter le rate limit
 """
 
-import glob
 import json
 import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-# --- Configuration via environment variables ---
+# --- Configuration ---
 BASE_DIR = os.environ.get("OPENPLAWD_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROCESSED_FILE = os.path.join(BASE_DIR, "data", "processed.json")
 TMP_DIR = os.path.join(BASE_DIR, "tmp")
 
 PLAUD_API_BASE = "https://api.plaud.ai"
-GROQ_API_BASE = "https://api.groq.com/openai/v1/audio/transcriptions"
-OPENAI_API_BASE = "https://api.openai.com/v1/audio/transcriptions"
-GROQ_MODEL = "whisper-large-v3-turbo"
-OPENAI_MODEL = "whisper-1"
+GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODEL = "whisper-large-v3"
+WHISPER_LANGUAGE = "fr"
+CHUNK_MAX_MB = 24
+CHUNK_DURATION_MIN = 15
+CHUNK_OVERLAP_SEC = 5
+CHUNK_PAUSE_SEC = 8  # pause between chunks to avoid rate limit
 
-MAX_FILE_SIZE_MB = 24
-MAX_FAILURES = 3
 MAX_RETRIES = 3
-LARGE_DURATION_THRESHOLD = 90 * 60  # 90 min in seconds → switch to OpenAI
-PARALLEL_WORKERS_OPENAI = 4
-PARALLEL_WORKERS_GROQ = 1
+MAX_FAILURES = 3
 
-# Statuses in processed.json
 STATUS_NOTIFIED = "notified"
 STATUS_TRANSCRIBING = "transcribing"
 STATUS_TRANSCRIBED = "transcribed"
 STATUS_DONE = "done"
+
+TOKENS_ENV = os.path.expanduser("~/.claude/env/tokens.env")
 
 
 def log(msg):
@@ -48,10 +47,17 @@ def log(msg):
 
 
 def load_env_key(name, required=True):
-    """Load a key from environment variables."""
+    """Load from env var, fallback to ~/.claude/env/tokens.env."""
     val = os.environ.get(name)
+    if not val and os.path.exists(TOKENS_ENV):
+        with open(TOKENS_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
     if not val and required:
-        log(f"ERROR: {name} environment variable is required")
+        log(f"ERROR: {name} not found in env or {TOKENS_ENV}")
         sys.exit(1)
     return val
 
@@ -109,7 +115,6 @@ def save_processed(processed):
 
 
 def should_process(rec, processed):
-    """Determine if this recording needs processing this run."""
     rec_id = rec["id"]
     version = rec.get("version_ms", 0)
     entry = processed.get(rec_id, {})
@@ -124,6 +129,9 @@ def should_process(rec, processed):
         log(f"SKIP {rec_id}: transcription ready, waiting for CR generation")
         return False
 
+    if entry.get("status") == STATUS_DONE:
+        return False
+
     if entry.get("fail_count", 0) >= MAX_FAILURES:
         log(f"SKIP {rec_id}: {entry.get('fail_count')} consecutive failures")
         return False
@@ -132,13 +140,20 @@ def should_process(rec, processed):
 
 
 def is_first_detection(rec_id, processed):
-    """True if this is the first time we see this recording."""
     entry = processed.get(rec_id, {})
     return not entry.get("status") and not entry.get("processed_at")
 
 
 def download_recording(rec, token):
     file_id = rec["id"]
+    out_path = os.path.join(TMP_DIR, f"{file_id}.mp3")
+
+    # Skip download if file already exists (resume)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        log(f"Audio already downloaded: {file_id}.mp3 ({size_mb:.1f} MB)")
+        return out_path
+
     data = retry_get(
         f"{PLAUD_API_BASE}/file/temp-url/{file_id}?is_opus=1",
         plaud_headers(token),
@@ -147,211 +162,179 @@ def download_recording(rec, token):
         raise RuntimeError(f"Could not get download URL for {file_id}")
 
     url = data["temp_url"]
-    ext = "opus" if "opus" in url.lower() else "mp3"
-    out_path = os.path.join(TMP_DIR, f"{file_id}.{ext}")
-
     resp = requests.get(url, timeout=300)
     resp.raise_for_status()
     with open(out_path, "wb") as f:
         f.write(resp.content)
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
-    log(f"Downloaded {file_id}.{ext} ({size_mb:.1f} MB)")
+    log(f"Downloaded {file_id}.mp3 ({size_mb:.1f} MB)")
     return out_path
 
 
-def split_audio(audio_path):
-    """Split audio file into chunks < MAX_FILE_SIZE_MB using ffmpeg."""
-    size_mb = os.path.getsize(audio_path) / 1024 / 1024
-    if size_mb <= MAX_FILE_SIZE_MB:
-        return [audio_path]
-
-    n_chunks = int(size_mb / MAX_FILE_SIZE_MB) + 1
+def get_audio_duration(audio_path):
     result = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
          "-of", "csv=p=0", audio_path],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=30,
     )
-    total_duration = float(result.stdout.strip())
-    chunk_duration = total_duration / n_chunks
-
-    base = os.path.splitext(audio_path)[0]
-    ext = os.path.splitext(audio_path)[1]
-    chunk_pattern = f"{base}_chunk%03d{ext}"
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", audio_path, "-f", "segment",
-         "-segment_time", str(int(chunk_duration)),
-         "-c", "copy", chunk_pattern],
-        capture_output=True, text=True
-    )
-
-    chunks = sorted(glob.glob(f"{base}_chunk*{ext}"))
-    if not chunks:
-        log("ERROR: ffmpeg produced no chunks")
-        return [audio_path]
-
-    log(f"Audio split into {len(chunks)} chunks ({size_mb:.1f} MB total)")
-    return chunks
+    if result.returncode == 0 and result.stdout.strip():
+        return float(result.stdout.strip())
+    return None
 
 
-def transcribe_chunk_groq(audio_path, groq_key):
-    with open(audio_path, "rb") as f:
-        resp = requests.post(
-            GROQ_API_BASE,
-            headers={"Authorization": f"Bearer {groq_key}"},
-            files={"file": (os.path.basename(audio_path), f)},
-            data={"model": GROQ_MODEL, "language": "fr", "response_format": "text"},
-            timeout=300,
+def chunk_audio(audio_path, rec_id):
+    """Split audio into chunks if > CHUNK_MAX_MB. Returns list of chunk paths."""
+    size_mb = os.path.getsize(audio_path) / 1024 / 1024
+
+    if size_mb <= CHUNK_MAX_MB:
+        return [audio_path], False
+
+    duration = get_audio_duration(audio_path)
+    if duration is None:
+        raise RuntimeError(f"Cannot determine duration of {audio_path}")
+
+    chunk_seconds = CHUNK_DURATION_MIN * 60
+    chunks = []
+    start = 0
+    idx = 0
+
+    while start < duration:
+        chunk_path = os.path.join(TMP_DIR, f"{rec_id}_chunk{idx:03d}.mp3")
+
+        # Skip if chunk already exists (resume)
+        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+            chunks.append(chunk_path)
+            start += chunk_seconds
+            idx += 1
+            continue
+
+        end = min(start + chunk_seconds + CHUNK_OVERLAP_SEC, duration)
+        actual_duration = end - start
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path,
+             "-ss", str(start), "-t", str(actual_duration),
+             "-ar", "16000", "-ac", "1", "-b:a", "64k",
+             chunk_path],
+            capture_output=True, timeout=120,
         )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:200]}")
-    return resp.text.strip()
+
+        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+            chunk_mb = os.path.getsize(chunk_path) / 1024 / 1024
+            log(f"  Chunk {idx}: {start/60:.0f}-{end/60:.0f}min ({chunk_mb:.1f} MB)")
+            chunks.append(chunk_path)
+
+        start += chunk_seconds
+        idx += 1
+
+    log(f"Split into {len(chunks)} chunks")
+    return chunks, True
 
 
-def transcribe_chunk_openai(audio_path, openai_key):
-    with open(audio_path, "rb") as f:
-        resp = requests.post(
-            OPENAI_API_BASE,
-            headers={"Authorization": f"Bearer {openai_key}"},
-            files={"file": (os.path.basename(audio_path), f)},
-            data={"model": OPENAI_MODEL, "language": "fr", "response_format": "text"},
-            timeout=300,
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenAI Whisper error {resp.status_code}: {resp.text[:200]}")
-    return resp.text.strip()
+def transcribe_groq(audio_path, groq_key):
+    """Transcribe a single file via Groq. Returns text or None on rate limit."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            with open(audio_path, "rb") as f:
+                resp = requests.post(
+                    GROQ_API_URL,
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                    files={"file": (os.path.basename(audio_path), f)},
+                    data={"model": GROQ_MODEL, "language": WHISPER_LANGUAGE},
+                    timeout=300,
+                )
+
+            if resp.status_code == 200:
+                return resp.json().get("text", "")
+
+            if resp.status_code == 429:
+                # Return None to signal rate limit — caller decides what to do
+                return None
+
+            resp.raise_for_status()
+
+        except requests.Timeout:
+            log(f"  Timeout on attempt {attempt + 1}")
+            time.sleep(10)
+        except requests.RequestException as e:
+            log(f"  Request error on attempt {attempt + 1}: {e}")
+            time.sleep(5 * (attempt + 1))
+
+    raise RuntimeError(f"Groq transcription failed after {MAX_RETRIES} attempts")
 
 
-def _transcribe_chunk_worker(args):
-    """Worker for ThreadPoolExecutor: transcribe a chunk and return (index, text)."""
-    i, chunk, use_openai, groq_key, openai_key, n_total = args
-    log(f"  Chunk {i + 1}/{n_total}...")
-    if use_openai:
-        text = transcribe_chunk_openai(chunk, openai_key)
-    else:
-        text = transcribe_chunk_groq(chunk, groq_key)
-    return i, text
+def transcribe(audio_path, rec_id, processed):
+    """Transcribe audio via Groq with chunking and resume support."""
+    duration_min = processed.get(rec_id, {}).get("duration_min", "?")
+    groq_key = load_env_key("GROQ_API_KEY")
 
+    log(f"Transcribing {os.path.basename(audio_path)} ({duration_min}min) via Groq Whisper...")
 
-def transcribe_with_resume(audio_path, duration_secs, rec_id, processed, groq_key, openai_key):
-    """
-    Transcribe with resume on interruption and parallelism for OpenAI.
-    - OpenAI (>= 90 min): parallel chunks (PARALLEL_WORKERS_OPENAI)
-    - Groq (< 90 min): sequential with resume (hourly quota)
-    Returns (txt_path, word_count) if complete, (None, None) if partial.
-    """
-    use_openai = duration_secs >= LARGE_DURATION_THRESHOLD
-    provider = "OpenAI Whisper" if use_openai else "Groq"
-    log(f"Transcribing {os.path.basename(audio_path)} ({duration_secs // 60}min) via {provider}...")
-
-    if use_openai and not openai_key:
-        raise RuntimeError("OpenAI key required for recordings >= 90 min")
-
-    chunks = split_audio(audio_path)
-    n_total = len(chunks)
     entry = processed.get(rec_id, {})
+    entry["status"] = STATUS_TRANSCRIBING
+    entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    processed[rec_id] = entry
+    save_processed(processed)
 
-    try:
-        if use_openai:
-            workers = min(PARALLEL_WORKERS_OPENAI, n_total)
-            log(f"  Launching {workers} parallel workers on {n_total} chunks...")
+    # Chunk if needed
+    chunks, is_chunked = chunk_audio(audio_path, rec_id)
 
-            results = {}
-            failed = False
+    # Transcribe each chunk (with resume support)
+    all_text = []
+    rate_limited = False
 
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(
-                        _transcribe_chunk_worker,
-                        (i, chunk, True, groq_key, openai_key, n_total)
-                    ): i
-                    for i, chunk in enumerate(chunks)
-                }
-                for future in as_completed(futures):
-                    try:
-                        idx, text = future.result()
-                        results[idx] = text
-                        entry["status"] = STATUS_TRANSCRIBING
-                        entry["chunks_done"] = len(results)
-                        entry["chunks_total"] = n_total
-                        entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        processed[rec_id] = entry
-                        save_processed(processed)
-                    except Exception as e:
-                        log(f"Chunk error: {e}")
-                        failed = True
-                        entry["fail_count"] = entry.get("fail_count", 0) + 1
-                        entry["last_error"] = str(e)[:200]
-                        entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        processed[rec_id] = entry
-                        save_processed(processed)
+    for i, chunk_path in enumerate(chunks):
+        # Check if this chunk was already transcribed
+        chunk_txt_path = chunk_path.rsplit(".", 1)[0] + ".txt"
+        if os.path.exists(chunk_txt_path):
+            with open(chunk_txt_path, encoding="utf-8") as f:
+                all_text.append(f.read())
+            log(f"  Chunk {i + 1}/{len(chunks)}: already done (resume)")
+            continue
 
-            if failed or len(results) < n_total:
-                log(f"Incomplete transcription: {len(results)}/{n_total} chunks")
-                return None, None
+        if is_chunked:
+            log(f"  Transcribing chunk {i + 1}/{len(chunks)}...")
 
-            text_parts = [results[i] for i in sorted(results.keys())]
+        # Pause between chunks to avoid rate limit
+        if i > 0:
+            time.sleep(CHUNK_PAUSE_SEC)
 
-        else:
-            chunks_done = entry.get("chunks_done", 0)
-            text_parts = entry.get("partial_text_parts", [])
+        text = transcribe_groq(chunk_path, groq_key)
 
-            if chunks_done > 0:
-                log(f"Resuming from chunk {chunks_done + 1}/{n_total}")
+        if text is None:
+            # Rate limited — save progress and stop
+            log(f"  Rate limited at chunk {i + 1}/{len(chunks)}. Progress saved, retry later.")
+            entry["chunks_done"] = i
+            entry["chunks_total"] = len(chunks)
+            processed[rec_id] = entry
+            save_processed(processed)
+            rate_limited = True
+            break
 
-            for i, chunk in enumerate(chunks):
-                if i < chunks_done:
-                    if chunk != audio_path:
-                        try:
-                            os.remove(chunk)
-                        except OSError:
-                            pass
-                    continue
+        # Save chunk transcript immediately
+        with open(chunk_txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        all_text.append(text)
 
-                try:
-                    _, text = _transcribe_chunk_worker(
-                        (i, chunk, False, groq_key, openai_key, n_total)
-                    )
-                    text_parts.append(text)
-                    chunks_done = i + 1
+    if rate_limited:
+        return None, 0
 
-                    entry["status"] = STATUS_TRANSCRIBING
-                    entry["chunks_done"] = chunks_done
-                    entry["chunks_total"] = n_total
-                    entry["partial_text_parts"] = text_parts
-                    entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    processed[rec_id] = entry
-                    save_processed(processed)
-
-                except Exception as e:
-                    log(f"Chunk {i + 1}/{n_total} error: {e}")
-                    entry["fail_count"] = entry.get("fail_count", 0) + 1
-                    entry["last_error"] = str(e)[:200]
-                    entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    processed[rec_id] = entry
-                    save_processed(processed)
-                    return None, None
-
-                finally:
-                    if chunk != audio_path:
-                        try:
-                            os.remove(chunk)
-                        except OSError:
-                            pass
-
-    finally:
-        for chunk in chunks:
-            if chunk != audio_path:
-                try:
-                    os.remove(chunk)
-                except OSError:
-                    pass
-
-    full_text = " ".join(text_parts).strip()
+    # All chunks done — concatenate
+    full_text = "\n".join(all_text)
     txt_path = os.path.join(TMP_DIR, f"{rec_id}.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(full_text)
+
+    # Cleanup chunk files
+    if is_chunked:
+        for chunk_path in chunks:
+            for ext in [".mp3", ".txt"]:
+                p = chunk_path.rsplit(".", 1)[0] + ext
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     word_count = len(full_text.split())
     log(f"Transcription complete: {word_count} words -> {txt_path}")
@@ -394,111 +377,105 @@ def main():
     os.makedirs(TMP_DIR, exist_ok=True)
 
     plaud_token = load_env_key("PLAUD_TOKEN")
-    groq_key = load_env_key("GROQ_API_KEY")
-    openai_key = load_env_key("OPENAI_API_KEY", required=False)
-
     check_connection(plaud_token)
 
     recordings = list_recordings(plaud_token)
     processed = load_processed()
 
-    to_process = [r for r in recordings if should_process(r, processed)]
+    # Sort by date (oldest first) to process in order
+    to_process = sorted(
+        [r for r in recordings if should_process(r, processed)],
+        key=lambda r: r.get("duration", 0),
+    )
 
     if not to_process:
         log(f"Nothing to process ({len(recordings)} recordings)")
         print(json.dumps({
-            "new_detected": [],
-            "transcriptions_complete": [],
-            "transcriptions_in_progress": [],
+            "status": "idle",
+            "total_recordings": len(recordings),
+            "pending": 0,
         }))
         return
 
-    new_detected = []
-    transcriptions_complete = []
-    transcriptions_in_progress = []
+    # Process ONE recording only
+    rec = to_process[0]
+    rec_id = rec["id"]
+    filename = rec.get("filename", "")
+    duration = rec.get("duration", 0) // 1000
 
-    for rec in to_process:
-        rec_id = rec["id"]
-        filename = rec.get("filename", "")
-        duration = rec.get("duration", 0) // 1000
+    first_time = is_first_detection(rec_id, processed)
 
-        first_time = is_first_detection(rec_id, processed)
+    if first_time:
+        entry = processed.get(rec_id, {})
+        entry["status"] = STATUS_NOTIFIED
+        entry["notified_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry["duration_min"] = duration // 60
+        processed[rec_id] = entry
+        save_processed(processed)
+        log(f"New: {filename} ({duration // 60}min)")
 
-        if first_time:
-            entry = processed.get(rec_id, {})
-            entry["status"] = STATUS_NOTIFIED
-            entry["notified_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            processed[rec_id] = entry
-            save_processed(processed)
-            new_detected.append({
+    audio_path = None
+    try:
+        audio_path = download_recording(rec, plaud_token)
+        txt_path, word_count = transcribe(audio_path, rec_id, processed)
+
+        if txt_path is None:
+            # Rate limited — partial progress saved
+            print(json.dumps({
+                "status": "rate_limited",
                 "rec_id": rec_id,
                 "filename": filename,
                 "duration": duration,
-                "version_ms": rec.get("version_ms", 0),
-            })
-            log(f"New: {filename} ({duration // 60}min) via {'OpenAI' if duration >= LARGE_DURATION_THRESHOLD else 'Groq'}")
+                "chunks_done": processed.get(rec_id, {}).get("chunks_done", 0),
+                "chunks_total": processed.get(rec_id, {}).get("chunks_total", 0),
+                "pending": len(to_process),
+                "message": "Rate limited. Run again later to resume.",
+            }))
+            return
 
-        audio_path = None
-        try:
-            audio_path = download_recording(rec, plaud_token)
-            txt_path, word_count = transcribe_with_resume(
-                audio_path, duration, rec_id, processed, groq_key, openai_key
-            )
+        entry = processed.get(rec_id, {})
+        entry["status"] = STATUS_TRANSCRIBED
+        entry["transcript_path"] = txt_path
+        entry["word_count"] = word_count
+        entry["version_ms"] = rec.get("version_ms", 0)
+        processed[rec_id] = entry
+        save_processed(processed)
 
-            if txt_path is not None:
-                entry = processed.get(rec_id, {})
-                entry["status"] = STATUS_TRANSCRIBED
-                entry["transcript_path"] = txt_path
-                entry["word_count"] = word_count
-                entry["version_ms"] = rec.get("version_ms", 0)
-                entry.pop("partial_text_parts", None)
-                entry.pop("chunks_done", None)
-                entry.pop("chunks_total", None)
-                processed[rec_id] = entry
-                save_processed(processed)
+        print(json.dumps({
+            "status": "transcribed",
+            "rec_id": rec_id,
+            "filename": filename,
+            "duration": duration,
+            "transcript_path": txt_path,
+            "word_count": word_count,
+            "is_new": first_time,
+            "pending": len(to_process) - 1,
+        }))
 
-                transcriptions_complete.append({
-                    "rec_id": rec_id,
-                    "filename": filename,
-                    "duration": duration,
-                    "transcript_path": txt_path,
-                    "word_count": word_count,
-                    "version_ms": rec.get("version_ms", 0),
-                    "is_new": first_time,
-                })
-            else:
-                entry = processed.get(rec_id, {})
-                transcriptions_in_progress.append({
-                    "rec_id": rec_id,
-                    "filename": filename,
-                    "duration": duration,
-                    "chunks_done": entry.get("chunks_done", 0),
-                    "chunks_total": entry.get("chunks_total", "?"),
-                    "is_new": first_time,
-                })
+    except Exception as e:
+        log(f"ERROR on {rec_id}: {e}")
+        entry = processed.get(rec_id, {})
+        entry["fail_count"] = entry.get("fail_count", 0) + 1
+        entry["last_error"] = str(e)[:200]
+        entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        processed[rec_id] = entry
+        save_processed(processed)
 
-        except Exception as e:
-            log(f"ERROR on {rec_id}: {e}")
-            entry = processed.get(rec_id, {})
-            entry["fail_count"] = entry.get("fail_count", 0) + 1
-            entry["last_error"] = str(e)[:200]
-            entry["last_attempt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            processed[rec_id] = entry
-            save_processed(processed)
+        print(json.dumps({
+            "status": "error",
+            "rec_id": rec_id,
+            "filename": filename,
+            "error": str(e)[:200],
+            "pending": len(to_process) - 1,
+        }))
 
-        finally:
-            if audio_path:
-                try:
-                    os.remove(audio_path)
-                except OSError:
-                    pass
-
-    output = {
-        "new_detected": new_detected,
-        "transcriptions_complete": transcriptions_complete,
-        "transcriptions_in_progress": transcriptions_in_progress,
-    }
-    print(json.dumps(output, indent=2))
+    finally:
+        # Don't delete audio if transcription incomplete (resume)
+        if audio_path and processed.get(rec_id, {}).get("status") == STATUS_TRANSCRIBED:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
