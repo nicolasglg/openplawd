@@ -1,5 +1,13 @@
 # OpenPlawd
 
+> ⚠️ **This project is no longer actively maintained (as of April 2026).**
+>
+> I'm not using OpenPlawd myself anymore (I've moved away from my OpenClaw setup), so I won't be shipping new fixes or features here going forward. The code as-is works for the setups it was tested against, but new issues and pull requests will not be actively worked on from my side.
+>
+> **Want to keep it going?** The repo stays public on purpose — feel free to fork it and take it wherever you need.
+>
+> Thanks to everyone who used, tested, and reported issues on this project 🙏
+
 [![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-orange?style=flat-square)](https://openclaw.ai)
 [![License](https://img.shields.io/github/license/nicolasglg/openplawd?style=flat-square)](LICENSE)
 [![Buy Me A Beer](https://img.shields.io/badge/Buy%20Me%20A%20Beer-support-yellow?style=flat-square&logo=buy-me-a-coffee)](https://buymeacoffee.com/nicolasglg)
