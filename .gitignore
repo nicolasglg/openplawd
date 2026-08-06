@@ -1,6 +1,6 @@
 .env
 config/*.txt
-data/processed.json
+data/*.json
 tmp/
 __pycache__/
 *.pyc

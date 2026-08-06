@@ -17,15 +17,65 @@ import time
 
 import requests
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+import plaud_official
+
 # --- Configuration ---
 BASE_DIR = os.environ.get("OPENPLAWD_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROCESSED_FILE = os.path.join(BASE_DIR, "data", "processed.json")
 TMP_DIR = os.path.join(BASE_DIR, "tmp")
 
-PLAUD_API_BASE = "https://api.plaud.ai"
-GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_MODEL = "whisper-large-v3"
+# The legacy web API is region-specific. Do not permit arbitrary URLs because
+# its bearer token is sent in every request.
+LEGACY_PLAUD_API_BASES = frozenset({"https://api-euc1.plaud.ai"})
+
+
+def legacy_plaud_api_base() -> str:
+    base = (os.environ.get("PLAUD_API_BASE") or os.environ.get("PLAUD_API_DOMAIN") or "https://api-euc1.plaud.ai").rstrip("/")
+    if base not in LEGACY_PLAUD_API_BASES:
+        raise ValueError("PLAUD_API_BASE must be an official HTTPS Plaud EU API endpoint")
+    return base
+
+
+def plaud_source() -> str:
+    source = os.environ.get("PLAUD_SOURCE", "auto").lower()
+    if source not in {"auto", "official", "legacy"}:
+        raise ValueError("PLAUD_SOURCE must be one of: auto, official, legacy")
+    return source
+
+
+PLAUD_API_BASE = legacy_plaud_api_base()
+# Whisper provider — override via env to use the approved OpenAI fallback:
+#   WHISPER_API_URL=https://api.openai.com/v1/audio/transcriptions
+#   WHISPER_MODEL=whisper-1
+#   WHISPER_API_KEY_ENV=OPENAI_API_KEY
+WHISPER_PROVIDERS = {
+    "https://api.groq.com/openai/v1/audio/transcriptions": {
+        "key_env": "GROQ_API_KEY",
+        "models": {"whisper-large-v3"},
+    },
+    "https://api.openai.com/v1/audio/transcriptions": {
+        "key_env": "OPENAI_API_KEY",
+        "models": {"whisper-1"},
+    },
+}
+
+
+def whisper_config():
+    url = os.environ.get("WHISPER_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
+    model = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
+    key_env = os.environ.get("WHISPER_API_KEY_ENV", "GROQ_API_KEY")
+    provider = WHISPER_PROVIDERS.get(url)
+    if provider is None or key_env != provider["key_env"] or model not in provider["models"]:
+        raise ValueError("Unsupported Whisper provider, key, or model configuration")
+    return url, model, key_env
+
+
+GROQ_API_URL, GROQ_MODEL, WHISPER_API_KEY_ENV = whisper_config()
 WHISPER_LANGUAGE = "fr"
+PLAUD_SOURCE = plaud_source()
 CHUNK_MAX_MB = 24
 CHUNK_DURATION_MIN = 15
 CHUNK_OVERLAP_SEC = 5
@@ -72,7 +122,7 @@ def plaud_headers(token):
 def retry_get(url, hdrs):
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.get(url, headers=hdrs, timeout=30)
+            resp = requests.get(url, headers=hdrs, timeout=30, allow_redirects=False)
             data = resp.json()
             if data.get("status") == 0:
                 return data
@@ -82,15 +132,43 @@ def retry_get(url, hdrs):
     return None
 
 
-def check_connection(token):
+def official_available():
+    return PLAUD_SOURCE in {"auto", "official"} and plaud_official.available()
+
+
+def check_connection(token=None):
+    if official_available():
+        try:
+            plaud_official.check_connection()
+            log("Plaud official CLI connection OK")
+            return
+        except plaud_official.PlaudOfficialError as exc:
+            if PLAUD_SOURCE == "official":
+                log(f"ERROR: Plaud official CLI unavailable — {exc}")
+                sys.exit(1)
+            log(f"Official CLI unavailable, falling back to legacy API: {exc}")
+    if not token:
+        log("ERROR: neither Plaud official OAuth nor PLAUD_TOKEN is available")
+        sys.exit(1)
     data = retry_get(f"{PLAUD_API_BASE}/device/list", plaud_headers(token))
     if data is None:
         log("ERROR: Plaud API unreachable — token may be invalid or expired")
         sys.exit(1)
-    log("Plaud API connection OK")
+    log("Plaud legacy API connection OK")
 
 
-def list_recordings(token):
+def list_recordings(token=None):
+    if official_available():
+        try:
+            recordings = plaud_official.list_recordings(page_size=100)
+            log(f"Listed {len(recordings)} recordings via official CLI")
+            return recordings
+        except plaud_official.PlaudOfficialError as exc:
+            if PLAUD_SOURCE == "official":
+                raise
+            log(f"Official CLI list failed, falling back to legacy API: {exc}")
+    if not token:
+        raise RuntimeError("PLAUD_TOKEN required for legacy list fallback")
     data = retry_get(
         f"{PLAUD_API_BASE}/file/simple/web?is_trash=0&sort_by=edit_time&is_desc=true",
         plaud_headers(token),
@@ -144,7 +222,7 @@ def is_first_detection(rec_id, processed):
     return not entry.get("status") and not entry.get("processed_at")
 
 
-def download_recording(rec, token):
+def download_recording(rec, token=None):
     file_id = rec["id"]
     out_path = os.path.join(TMP_DIR, f"{file_id}.mp3")
 
@@ -154,16 +232,34 @@ def download_recording(rec, token):
         log(f"Audio already downloaded: {file_id}.mp3 ({size_mb:.1f} MB)")
         return out_path
 
-    data = retry_get(
-        f"{PLAUD_API_BASE}/file/temp-url/{file_id}?is_opus=1",
-        plaud_headers(token),
-    )
-    if data is None or not data.get("temp_url"):
-        raise RuntimeError(f"Could not get download URL for {file_id}")
-
-    url = data["temp_url"]
-    resp = requests.get(url, timeout=300)
-    resp.raise_for_status()
+    url = None
+    if rec.get("source") == "official_cli" or official_available():
+        try:
+            url = plaud_official.get_audio_url(file_id)
+            log(f"Audio URL resolved via official CLI for {file_id}")
+        except plaud_official.PlaudOfficialError as exc:
+            if PLAUD_SOURCE == "official" or not token:
+                raise RuntimeError(str(exc)) from exc
+            log(f"Official audio lookup failed, falling back to legacy API: {exc}")
+    if not url:
+        if not token:
+            raise RuntimeError("PLAUD_TOKEN required for legacy audio fallback")
+        data = retry_get(
+            f"{PLAUD_API_BASE}/file/temp-url/{file_id}?is_opus=1",
+            plaud_headers(token),
+        )
+        if data is None or not data.get("temp_url"):
+            raise RuntimeError(f"Could not get download URL for {file_id}")
+        url = data["temp_url"]
+    plaud_official.validate_audio_url(url)
+    try:
+        resp = requests.get(url, timeout=300, allow_redirects=False)
+        if 300 <= resp.status_code < 400:
+            raise requests.RequestException("Audio download redirect refused")
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        # Signed audio URLs must not reach cron logs or processed.json.
+        raise RuntimeError(f"Audio download failed for {file_id}") from None
     with open(out_path, "wb") as f:
         f.write(resp.content)
 
@@ -243,6 +339,7 @@ def transcribe_groq(audio_path, groq_key):
                     files={"file": (os.path.basename(audio_path), f)},
                     data={"model": GROQ_MODEL, "language": WHISPER_LANGUAGE},
                     timeout=300,
+                    allow_redirects=False,
                 )
 
             if resp.status_code == 200:
@@ -267,7 +364,7 @@ def transcribe_groq(audio_path, groq_key):
 def transcribe(audio_path, rec_id, processed):
     """Transcribe audio via Groq with chunking and resume support."""
     duration_min = processed.get(rec_id, {}).get("duration_min", "?")
-    groq_key = load_env_key("GROQ_API_KEY")
+    groq_key = load_env_key(WHISPER_API_KEY_ENV)
 
     log(f"Transcribing {os.path.basename(audio_path)} ({duration_min}min) via Groq Whisper...")
 
@@ -348,6 +445,7 @@ def rename_recording(rec_id, new_name, token):
         headers=plaud_headers(token),
         json={"filename": new_name},
         timeout=30,
+        allow_redirects=False,
     )
     if resp.status_code == 200:
         log(f"Renamed {rec_id} -> {new_name}")
@@ -364,6 +462,7 @@ def trash_recording(rec_id, token):
         headers=plaud_headers(token),
         json=[rec_id],
         timeout=30,
+        allow_redirects=False,
     )
     if resp.status_code == 200:
         log(f"Trashed: {rec_id}")
@@ -376,7 +475,7 @@ def trash_recording(rec_id, token):
 def main():
     os.makedirs(TMP_DIR, exist_ok=True)
 
-    plaud_token = load_env_key("PLAUD_TOKEN")
+    plaud_token = load_env_key("PLAUD_TOKEN", required=False)
     check_connection(plaud_token)
 
     recordings = list_recordings(plaud_token)
@@ -399,6 +498,11 @@ def main():
 
     # Process ONE recording only
     rec = to_process[0]
+    if rec.get("source") == "official_cli":
+        try:
+            rec = plaud_official.enrich_recording(rec)
+        except plaud_official.PlaudOfficialError as exc:
+            log(f"Could not enrich official metadata for {rec.get('id')}: {exc}")
     rec_id = rec["id"]
     filename = rec.get("filename", "")
     duration = rec.get("duration", 0) // 1000

@@ -1,12 +1,17 @@
 # OpenPlawd
 
-> ⚠️ **This project is no longer actively maintained (as of April 2026).**
+> ⚠️ **Project archived — no longer maintained.**
 >
-> I'm not using OpenPlawd myself anymore (I've moved away from my OpenClaw setup), so I won't be shipping new fixes or features here going forward. The code as-is works for the setups it was tested against, but new issues and pull requests will not be actively worked on from my side.
+> Plaud now provides an official [MCP server](https://docs.plaud.ai/plaud-mcp-cli/mcp)
+> and [CLI](https://docs.plaud.ai/plaud-mcp-cli/cli) with supported OAuth access
+> to recordings, metadata, audio, transcripts, and summaries. New integrations
+> should use those official tools for authentication and read access.
 >
-> **Want to keep it going?** The repo stays public on purpose — feel free to fork it and take it wherever you need.
->
-> Thanks to everyone who used, tested, and reported issues on this project 🙏
+> OpenPlawd remains available as a reference for workflows that are not covered
+> by the official tools: free transcription through Groq or OpenAI, resumable
+> audio chunking, automated meeting-note pipelines, and legacy recording
+> rename/trash operations. No new features, compatibility fixes, or security
+> updates are planned.
 
 [![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-orange?style=flat-square)](https://openclaw.ai)
 [![License](https://img.shields.io/github/license/nicolasglg/openplawd?style=flat-square)](LICENSE)
@@ -19,6 +24,23 @@ Record a meeting with your Plaud device, and OpenPlawd handles the rest: downloa
 ```
 Plaud API → Download → Chunk → Whisper (Groq/OpenAI) → OpenClaw Agent → Meeting Notes → Email/CRM
 ```
+
+## What to use today
+
+| Need | Recommended solution |
+|------|----------------------|
+| Plaud authentication | Official Plaud CLI/MCP (OAuth) |
+| Browse and search recordings | Official Plaud CLI/MCP |
+| Retrieve a 24-hour audio URL | Official Plaud CLI |
+| Free/custom transcription | OpenPlawd with Groq or OpenAI |
+| Resumable chunking | OpenPlawd |
+| Historical meeting knowledge | Your own notes/knowledge base |
+| Rename or trash a recording | OpenPlawd legacy API, until officially supported |
+
+The repository includes an optional official-CLI adapter. When the pinned Plaud
+CLI is installed and authenticated, OpenPlawd uses it for read-only listing and
+audio access while keeping transcription on Groq. If OAuth is unavailable, the
+default `auto` mode falls back to the legacy regional API.
 
 ## What you get
 
@@ -67,7 +89,7 @@ git clone https://github.com/nicolasglg/openplawd.git
 ### 2. Install Python dependencies
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 ```
 
 ### 3. Copy the skill
@@ -111,6 +133,41 @@ cd ~/.openclaw/workspace/openplawd
 PLAUD_TOKEN="bearer eyJ..." GROQ_API_KEY="gsk_..." python3 scripts/plaud-poll.py
 ```
 
+### Optional: official Plaud CLI for OAuth read access
+
+Audit and pin a specific CLI version rather than executing `@latest` blindly:
+
+```bash
+npm install -g @plaud-ai/cli@0.3.7 --ignore-scripts
+DO_NOT_TRACK=1 PLAUD_TELEMETRY_DISABLED=1 plaud login
+```
+
+Then run OpenPlawd in hybrid mode. The adapter executes only a trusted,
+user-owned wrapper and its audited bundle: both must be regular non-symlink
+files, not writable by group or others, and their SHA256 values must match.
+Keep `~/.plaud/cli.yaml` absent: OpenPlawd refuses to invoke the CLI if it
+exists, so a persistent `api_base` cannot redirect OAuth.
+
+```bash
+PLAUD_SOURCE=auto \
+PLAUD_OFFICIAL_CLI="/absolute/path/to/plaud-wrapper" \
+PLAUD_OFFICIAL_CLI_SHA256="<wrapper-sha256>" \
+PLAUD_OFFICIAL_BUNDLE_SHA256="<bundle-sha256>" \
+GROQ_API_KEY="..." \
+python3 scripts/plaud-poll.py
+```
+
+The audited bundle is fixed relative to the wrapper at
+`node_modules/@plaud-ai/cli/dist/index.js`. Compute each checksum after auditing
+with `sha256sum`; do not use a wrapper or bundle writable by group or others
+(for example, `chmod go-w <path>`). Both checksum variables are mandatory
+before even `plaud version` is executed.
+
+`auto` prefers the official CLI for listing and audio URLs, then falls back to
+the legacy regional API when `PLAUD_TOKEN` is available. `official` disables
+that fallback; `legacy` keeps the original behavior. The official CLI's
+transcript and summary commands are intentionally not used by OpenPlawd.
+
 Want to make my day? [![Buy Me A Beer](https://img.shields.io/badge/Buy%20Me%20A%20Beer-support-yellow?style=flat-square&logo=buy-me-a-coffee)](https://buymeacoffee.com/nicolasglg)
 
 ## Configuration
@@ -119,13 +176,21 @@ Want to make my day? [![Buy Me A Beer](https://img.shields.io/badge/Buy%20Me%20A
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PLAUD_TOKEN` | Yes | Plaud API bearer token |
+| `PLAUD_TOKEN` | Legacy fallback/cleanup | Required only for the legacy Plaud API, rename, and trash |
 | `GROQ_API_KEY` | Yes | Groq API key (free tier) |
 | `OPENAI_API_KEY` | No | OpenAI key (for recordings > 90 min) |
 | `RESEND_API_KEY` | No | Resend key (for email delivery) |
 | `EMAIL_FROM` | No | Sender email address |
 | `EMAIL_TO` | No | Recipient email address |
 | `OPENPLAWD_BASE_DIR` | No | Override base directory (default: repo root) |
+| `PLAUD_SOURCE` | No | `auto` (default), `official`, or `legacy` |
+| `PLAUD_OFFICIAL_CLI` | No | Absolute path to the trusted official `plaud` wrapper |
+| `PLAUD_OFFICIAL_CLI_SHA256` | With official CLI | Expected SHA256 of the wrapper (mandatory before invocation) |
+| `PLAUD_OFFICIAL_BUNDLE_SHA256` | With official CLI | Expected SHA256 of `node_modules/@plaud-ai/cli/dist/index.js` (mandatory before invocation) |
+| `PLAUD_OFFICIAL_TOKEN_FILE` | No | OAuth token file (default: `~/.plaud/tokens.json`) |
+| `WHISPER_API_URL` | No | Exact approved endpoint: Groq by default, or OpenAI fallback |
+| `WHISPER_MODEL` | No | `whisper-large-v3` for Groq; `whisper-1` for OpenAI |
+| `WHISPER_API_KEY_ENV` | No | Must match the endpoint: `GROQ_API_KEY` or `OPENAI_API_KEY` |
 
 ### Whisper corrections
 
